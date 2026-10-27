@@ -4,14 +4,16 @@ An RTT session adds a known delay on the Mac hotspot (``tools/hotspot_delay.py``
 and repeats the same tap at every level, as planned in a ledger from
 ``tools/make_rtt_ledger.py``.  Regressing visible completion time on the added
 round-trip time gives a slope ``k`` in milliseconds of screen time per
-millisecond of RTT: the *effective* number of serial network round trips the
-screen waited for.  Parallel requests count once; extra round trips from TCP
-slow start, loss recovery, or retries count too, and a cached or prefetched
-screen gives ``k`` near 0.
+millisecond of added RTT: this screen's RTT sensitivity in this setup.
+Only under a fixed, additive request-path model can serial round trips serve
+as an analogy for the slope; overlapping work, transport behavior, and app
+adaptation can produce the same slope with different request dependencies.
 
 The slope describes how this screen behaved under this manipulation.  It does
 not identify the protocol, the server design, or which requests formed the
-chain; compare it with the serial depth from ``tools/analyze_pcap.py``.
+chain.  Packet timing can supply additional hypotheses, not identify that
+dependency by numerical agreement alone.  Optional baseline RTT inputs are
+retained as context and do not establish network or non-network time shares.
 """
 
 from __future__ import annotations
@@ -153,8 +155,6 @@ def _fit(points: list[tuple[int, float, float]], base_rtt: float | None = None) 
     }
     if base_rtt is not None:
         result["base_rtt_ms"] = base_rtt
-        result["network_share_ms"] = round(slope * base_rtt, 3)
-        result["non_network_ms"] = round(intercept - slope * base_rtt, 3)
     if len(blocks) < _MIN_BOOTSTRAP_BLOCKS:
         return result
     rng = _seeded_rng(points)
@@ -172,11 +172,6 @@ def _fit(points: list[tuple[int, float, float]], base_rtt: float | None = None) 
         "slope_k": [round(_percentile(slopes, 0.025), 4), round(_percentile(slopes, 0.975), 4)],
         "intercept_ms": [round(_percentile(intercepts, 0.025), 3), round(_percentile(intercepts, 0.975), 3)],
     }
-    if base_rtt is not None:
-        shares = [k * base_rtt for k in slopes]
-        rest = [a - k * base_rtt for k, a in zip(slopes, intercepts)]
-        ci["network_share_ms"] = [round(_percentile(shares, 0.025), 3), round(_percentile(shares, 0.975), 3)]
-        ci["non_network_ms"] = [round(_percentile(rest, 0.025), 3), round(_percentile(rest, 0.975), 3)]
     result["bootstrap_95_ci"] = ci
     result["bootstrap_replicates_used"] = len(slopes)
     return result
@@ -301,10 +296,18 @@ def fit_session(observations: Iterable[Mapping[str, object]], ledger: list[dict[
         "preliminary": preliminary,
         "interpretation": {
             "slope_k": (
-                "Milliseconds of visible completion time per millisecond of added RTT; "
-                "effective count of serial round trips on the screen's critical path"
+                "RTT sensitivity: milliseconds of visible completion time per millisecond "
+                "of planned added RTT in this setup, not a direct round-trip count"
+            ),
+            "serial_round_trip_analogy": (
+                "A serial-round-trip analogy requires a fixed, additive request-path model; "
+                "overlap, transport behavior, and app adaptation prevent unique identification"
             ),
             "intercept_ms": "Fitted visible time at the session's baseline network (added RTT 0)",
+            "base_rtt_ms": (
+                "Optional user-supplied context only; it does not identify network or "
+                "non-network time shares and does not change the fitted slope or intercept"
+            ),
             "difference": "Toss minus KIS per pair; its slope is the gap's growth per ms of RTT",
             "bootstrap_ci": (
                 "Percentile bootstrap that resamples whole blocks; "
@@ -399,9 +402,9 @@ def render_markdown(result: dict[str, Any]) -> str:
         "# RTT 단계별 화면 시간 분석",
         "",
         "> 해석 범위: 기울기 k는 추가한 왕복 지연 1ms당 화면 완료 시간이 몇 ms 늘었는지다. "
-        "화면이 기다린 직렬 네트워크 왕복의 실효 횟수로 읽는다. 병렬 요청은 1회로, "
-        "큰 응답의 추가 왕복·재전송·재시도는 더해서 나타난다. 이 값은 이 기기·이 망 구성에서 관찰한 "
-        "지연 민감도이며, 프로토콜·서버 구조·어떤 요청이 사슬을 이뤘는지는 확정하지 않는다.",
+        "이는 이 기기·이 망 구성에서 관찰한 RTT 민감도다. 요청 경로가 고정된 가산 모형에서만 "
+        "직렬 왕복 수에 비유할 수 있으며, 작업 중첩·전송 동작·앱의 적응 때문에 같은 기울기도 "
+        "여러 구조에서 나올 수 있다. 실제 왕복 횟수·프로토콜·서버 구조·요청 간 의존성을 식별하지 않는다.",
         "",
     ]
     if result["preliminary"]:
@@ -466,26 +469,17 @@ def render_markdown(result: dict[str, Any]) -> str:
     if any(fit and "base_rtt_ms" in fit for fit in fits.values()):
         lines += [
             "",
-            "## 기본 망에서의 대략적 분해",
+            "## 입력한 기본 RTT (참고 정보)",
             "",
-            "`망 몫 = k × 기본 RTT`, `망 외 시간 = 추가 0ms 적합값 − 망 몫`. 기본 RTT는 별도 캡처에서 잰 값이라 "
-            "같은 시도의 측정이 아니며, 망 외 시간에는 클라이언트 처리·서버 처리·렌더링·측정 오차가 섞여 있다.",
+            "`--base-rtt` 입력은 참고 정보로만 보관하며 기울기·절편 적합에 사용하지 않는다. "
+            "측정 경로·시점·대상 연결이 다를 수 있고 화면의 요청 의존성을 알 수 없으므로, "
+            "이 값으로 화면 시간을 네트워크 시간과 나머지 시간으로 분해할 수 없다.",
             "",
             "| 항목 | 토스 | 한국투자 |",
             "|---|---:|---:|",
+            f"| 기본 RTT 입력(ms) | {_fmt(fits['toss'].get('base_rtt_ms')) if fits['toss'] else '-'} | "
+            f"{_fmt(fits['kis'].get('base_rtt_ms')) if fits['kis'] else '-'} |",
         ]
-        decomposition = [
-            ("기본 RTT 입력(ms)", lambda fit: _fmt(fit.get("base_rtt_ms"))),
-            ("망 몫(ms)", lambda fit: _fmt(fit.get("network_share_ms"))),
-            ("망 몫 95% 구간", lambda fit: _interval(fit, "network_share_ms")),
-            ("망 외 시간(ms)", lambda fit: _fmt(fit.get("non_network_ms"))),
-            ("망 외 시간 95% 구간", lambda fit: _interval(fit, "non_network_ms")),
-        ]
-        for title, getter in decomposition:
-            lines.append(
-                f"| {title} | {getter(fits['toss']) if fits['toss'] else '-'} | "
-                f"{getter(fits['kis']) if fits['kis'] else '-'} |"
-            )
     verification = result["verification"]
     lines += [
         "",
