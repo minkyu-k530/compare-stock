@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 data/
 trial-ledger*.csv
+rtt-ledger*.csv
 captures/
 frame_pts*.csv
 frames/

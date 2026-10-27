@@ -68,6 +68,8 @@ MARK_AFTER_S = 2.5
 #: Server-initiated bursts needed before a connection is called push-like.
 PUSH_MIN_UNSOLICITED = 3
 PUSH_MIN_DURATION_S = 3.0
+#: A request this soon after a response ends may depend on that response.
+DEFAULT_CHAIN_SLACK_S = 0.15
 
 _KEEP_SEGMENTS = 48
 _KEEP_DATAGRAMS = 64
@@ -822,9 +824,76 @@ def inspect_flows(flows: Sequence[Flow]) -> None:
 # User actions
 
 
+def flow_exchanges(flow: Flow) -> list[dict[str, Any]]:
+    """Round trips visible on one connection: TCP handshake and request → response bursts.
+
+    A response is a solicited server burst; its request is the first client
+    trigger after the previous burst.  The TCP handshake counts separately
+    because SYN/ACK carries no payload and never forms a burst.
+    """
+    exchanges = []
+    boundary = -math.inf
+    if flow.syn_ts is not None and flow.synack_ts is not None and flow.synack_ts > flow.syn_ts:
+        exchanges.append({"name": flow.name, "step": "tcp", "request": flow.syn_ts,
+                          "first": flow.synack_ts, "end": flow.synack_ts})
+        boundary = flow.synack_ts
+    hello = (flow.tls or {}).get("server_hello_ts")
+    quic_first = (flow.quic or {}).get("first_response_ts")
+    for burst in flow.bursts:
+        if burst["solicited"]:
+            request = next((ts for ts in flow.triggers
+                            if boundary < ts < burst["start"] and ts != flow.syn_ts), None)
+            if request is not None:
+                if hello is not None and burst["start"] <= hello <= burst["end"]:
+                    step = "tls_handshake"
+                elif quic_first is not None and burst["start"] <= quic_first <= burst["end"]:
+                    step = "quic_handshake"
+                else:
+                    step = "dns" if flow.kind == "dns" else "request"
+                exchanges.append({"name": flow.name, "step": step, "request": request,
+                                  "first": burst["start"], "end": burst["end"]})
+        boundary = max(boundary, burst["end"])
+    return exchanges
+
+
+def serial_chain(exchanges: Sequence[dict[str, Any]], *,
+                 slack: float = DEFAULT_CHAIN_SLACK_S) -> list[dict[str, Any]]:
+    """Longest run of exchanges where each request starts while or just after the previous response arrives.
+
+    Timing alone cannot prove that one request needed the previous response, so
+    the length is the serial depth *consistent with* the capture.  Ties keep the
+    run that spends the most time waiting for the network, then the one that
+    stays on the same connection.
+    """
+    ordered = sorted(exchanges, key=lambda exchange: (exchange["request"], exchange["first"]))
+    best: list[tuple[int, float, int | None]] = []
+    for position, exchange in enumerate(ordered):
+        wait = exchange["first"] - exchange["request"]
+        key, parent = (1, round(wait, 6), False), None
+        for earlier in range(position):
+            previous = ordered[earlier]
+            if not previous["first"] <= exchange["request"] <= previous["end"] + slack:
+                continue
+            candidate = (best[earlier][0] + 1, round(best[earlier][1] + wait, 6),
+                         previous["name"] == exchange["name"])
+            if candidate > key:
+                key, parent = candidate, earlier
+        best.append((key[0], key[1], parent))
+    if not best:
+        return []
+    position: int | None = max(range(len(best)), key=lambda number: best[number][:2])
+    chain = []
+    while position is not None:
+        chain.append(ordered[position])
+        position = best[position][2]
+    return chain[::-1]
+
+
 def find_actions(flows: Sequence[Flow], *, idle_gap: float = DEFAULT_IDLE_GAP_S,
-                 max_window: float = DEFAULT_MAX_WINDOW_S) -> list[dict[str, Any]]:
+                 max_window: float = DEFAULT_MAX_WINDOW_S,
+                 chain_slack: float = DEFAULT_CHAIN_SLACK_S) -> list[dict[str, Any]]:
     """Group client requests separated by quiet periods into actions."""
+    exchanges_by_flow = [flow_exchanges(flow) for flow in flows]
     points = sorted((ts, number) for number, flow in enumerate(flows) for ts in flow.triggers)
     groups: list[dict[str, Any]] = []
     for ts, number in points:
@@ -839,11 +908,12 @@ def find_actions(flows: Sequence[Flow], *, idle_gap: float = DEFAULT_IDLE_GAP_S,
         start = group["start"]
         following = groups[position + 1]["start"] if position + 1 < len(groups) else math.inf
         end = min(following, start + max_window)
-        new, reused, dns, servers = [], [], [], []
+        new, reused, dns, servers, exchanges = [], [], [], [], []
         first_response = span_end = None
         bytes_down = 0
         for number in sorted(group["flows"]):
             flow = flows[number]
+            exchanges.extend(e for e in exchanges_by_flow[number] if start <= e["request"] < end)
             responses = [b for b in flow.bursts if b["solicited"] and start <= b["start"] < end]
             flow_bytes = sum(size for ts, up, size in flow.events if not up and start <= ts < end)
             bytes_down += flow_bytes
@@ -875,6 +945,7 @@ def find_actions(flows: Sequence[Flow], *, idle_gap: float = DEFAULT_IDLE_GAP_S,
                 "span_ms": _ms(max(b["end"] for b in responses) - start) if responses else None,
             })
         servers.sort(key=lambda server: -server["bytes_down"])
+        chain = serial_chain(exchanges, slack=chain_slack)
         actions.append({
             "index": position + 1,
             "start_ts": start,
@@ -885,6 +956,12 @@ def find_actions(flows: Sequence[Flow], *, idle_gap: float = DEFAULT_IDLE_GAP_S,
             "first_response_ms": _ms(first_response - start) if first_response is not None else None,
             "network_span_ms": _ms(span_end - start) if span_end is not None else None,
             "bytes_down": bytes_down,
+            "serial_depth": len(chain),
+            "serial_wait_ms": _ms(sum(e["first"] - e["request"] for e in chain)) if chain else None,
+            "serial_chain": [
+                {"name": e["name"], "step": e["step"], "wait_ms": _ms(e["first"] - e["request"])}
+                for e in chain
+            ],
             "servers": servers,
             "mark": None,
             "background": False,
@@ -953,10 +1030,11 @@ def _public_flow(flow: Flow) -> dict[str, Any]:
 
 def analyze_packets(packets: Sequence[Packet], label: str, *, source: str | None = None,
                     marks: Sequence[float] | None = None, idle_gap: float = DEFAULT_IDLE_GAP_S,
-                    max_window: float = DEFAULT_MAX_WINDOW_S) -> dict[str, Any]:
+                    max_window: float = DEFAULT_MAX_WINDOW_S,
+                    chain_slack: float = DEFAULT_CHAIN_SLACK_S) -> dict[str, Any]:
     flows = build_flows(packets)
     inspect_flows(flows)
-    actions = find_actions(flows, idle_gap=idle_gap, max_window=max_window)
+    actions = find_actions(flows, idle_gap=idle_gap, max_window=max_window, chain_slack=chain_slack)
     mark_summary = apply_marks(actions, marks) if marks else None
     chosen = [a for a in actions if not a["background"]] if marks else actions
 
@@ -1037,10 +1115,16 @@ def analyze_packets(packets: Sequence[Packet], label: str, *, source: str | None
             "median_first_response_ms": _median(a["first_response_ms"] for a in chosen),
             "median_network_span_ms": _median(a["network_span_ms"] for a in chosen),
             "median_bytes_down": _median(a["bytes_down"] for a in chosen),
+            "median_serial_depth": _median(a["serial_depth"] for a in chosen),
+            "serial_depth_counts": {
+                str(depth): count for depth, count in sorted(Counter(a["serial_depth"] for a in chosen).items())
+            },
+            "median_serial_wait_ms": _median(a["serial_wait_ms"] for a in chosen),
         },
         "settings": {
             "idle_gap_s": idle_gap, "max_window_s": max_window, "burst_gap_s": BURST_GAP_S,
             "reaction_slack_s": REACTION_SLACK_S, "small_control_bytes": SMALL_CONTROL_BYTES,
+            "chain_slack_s": chain_slack,
         },
     }
     report["observation"] = observation_text(report)
@@ -1147,6 +1231,17 @@ _KIND_LABELS = {
 _PATTERN_LABELS = {
     "push_like": "서버 주도 반복 전송", "request_response": "요청-응답", "minimal": "데이터 적음",
 }
+_STEP_LABELS = {
+    "tcp": "TCP 연결", "tls_handshake": "TLS 핸드셰이크", "quic_handshake": "QUIC 핸드셰이크",
+    "dns": "DNS", "request": "요청",
+}
+
+
+def _chain_text(action: dict[str, Any]) -> str:
+    return " → ".join(
+        f"{_STEP_LABELS.get(step['step'], step['step'])}({step['name']}, {_fmt(step['wait_ms'])}ms)"
+        for step in action["serial_chain"]
+    ) or "-"
 
 
 def render_markdown(reports: Sequence[dict[str, Any]], tz: tzinfo) -> str:
@@ -1203,7 +1298,11 @@ def render_markdown(reports: Sequence[dict[str, Any]], tz: tzinfo) -> str:
         "## 동작(탭) 단위 요약",
         "",
         "`첫 응답`은 동작의 첫 요청 패킷부터 연결 준비가 끝난 뒤 처음 도착한 응답 데이터까지, "
-        "`네트워크 구간`은 그 동작에서 요청이 선행된 마지막 응답 데이터까지다. 둘 다 화면 표시 시각이 아니다.",
+        "`네트워크 구간`은 그 동작에서 요청이 선행된 마지막 응답 데이터까지다. 둘 다 화면 표시 시각이 아니다. "
+        "`직렬 왕복 깊이`는 각 요청이 앞 응답이 도착하는 동안이나 끝난 직후"
+        f"(`chain_slack_s`, 기본 {DEFAULT_CHAIN_SLACK_S}초 안)에 시작된 왕복을 이어 붙인 가장 긴 사슬의 길이다. "
+        "TCP 연결, TLS·QUIC 핸드셰이크, DNS, 요청-응답을 각각 1회로 센다. "
+        "시각만으로 판단한 추정이며, 앞 응답이 실제로 다음 요청의 조건이었는지는 확인하지 않는다.",
         "",
         "| 항목 | " + " | ".join(r["label"] for r in reports) + " |",
         "|---|" + "---:|" * len(reports),
@@ -1218,6 +1317,10 @@ def render_markdown(reports: Sequence[dict[str, Any]], tz: tzinfo) -> str:
         ("첫 응답 중앙값(ms)", lambda r: _fmt(r["action_summary"]["median_first_response_ms"])),
         ("네트워크 구간 중앙값(ms)", lambda r: _fmt(r["action_summary"]["median_network_span_ms"])),
         ("동작당 수신 바이트 중앙값", lambda r: _fmt(r["action_summary"]["median_bytes_down"], 0)),
+        ("직렬 왕복 깊이 중앙값", lambda r: _fmt(r["action_summary"]["median_serial_depth"])),
+        ("직렬 왕복 깊이 분포(깊이:동작 수)", lambda r: ", ".join(
+            f"{depth}:{count}" for depth, count in r["action_summary"]["serial_depth_counts"].items()) or "-"),
+        ("사슬 대기 합 중앙값(ms)", lambda r: _fmt(r["action_summary"]["median_serial_wait_ms"])),
     ]
     for title, getter in action_rows:
         lines.append(f"| {title} | " + " | ".join(getter(r) for r in reports) + " |")
@@ -1242,8 +1345,8 @@ def render_markdown(reports: Sequence[dict[str, Any]], tz: tzinfo) -> str:
             "",
             "### 동작별 기록",
             "",
-            "| # | 시작(현지) | 탭 표시 | 요청 | 신규 연결 | 재사용 | DNS | 첫 응답(ms) | 네트워크 구간(ms) | 수신 바이트 | 주요 서버 |",
-            "|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---|",
+            "| # | 시작(현지) | 탭 표시 | 요청 | 신규 연결 | 재사용 | DNS | 첫 응답(ms) | 네트워크 구간(ms) | 직렬 깊이 | 수신 바이트 | 주요 서버 |",
+            "|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
         ]
         for action in report["actions"]:
             new = ", ".join(
@@ -1256,8 +1359,19 @@ def render_markdown(reports: Sequence[dict[str, Any]], tz: tzinfo) -> str:
                 f"| {action['index']} | {_local(action['start_ts'], tz)} | {mark} | {action['requests']} | {new} | "
                 f"{len(action['reused_connections'])} | {len(action['dns_queries'])} | "
                 f"{_fmt(action['first_response_ms'])} | {_fmt(action['network_span_ms'])} | "
-                f"{action['bytes_down']} | {top} |"
+                f"{action['serial_depth']} | {action['bytes_down']} | {top} |"
             )
+        lines += [
+            "",
+            "### 직렬 왕복 사슬",
+            "",
+            "괄호 안 시간은 각 왕복에서 요청 패킷부터 응답 첫 데이터까지 기다린 시간이다.",
+            "",
+        ]
+        for action in report["actions"]:
+            if report["marks"] and action["background"]:
+                continue
+            lines.append(f"- #{action['index']} 깊이 {action['serial_depth']}: {_chain_text(action)}")
         lines += ["", f"`protocol_observation` 후보: {report['observation']}"]
     lines += [
         "",

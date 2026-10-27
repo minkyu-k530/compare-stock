@@ -51,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds of client silence that separate actions (default %(default)s)")
     parser.add_argument("--max-window", type=float, default=netmeta.DEFAULT_MAX_WINDOW_S,
                         help="longest response window per action in seconds (default %(default)s)")
+    parser.add_argument("--chain-slack", type=float, default=netmeta.DEFAULT_CHAIN_SLACK_S,
+                        help="seconds after a response within which a new request may depend on it "
+                             "(serial round-trip depth, default %(default)s)")
     parser.add_argument("--tz", default="Asia/Seoul", help="time zone for report times and HH:MM:SS marks")
     parser.add_argument("--out", type=Path, help="write the Markdown report here instead of stdout")
     parser.add_argument("--json", type=Path, help="also write the full JSON summary here")
@@ -59,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.idle_gap <= 0 or args.max_window <= 0:
         parser.error("--idle-gap and --max-window must be positive")
+    if args.chain_slack < 0:
+        parser.error("--chain-slack must not be negative")
     try:
         tz = netmeta.resolve_timezone(args.tz)
     except ValueError as exc:
@@ -95,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error(f"{marks_path}: {exc}")
         reports.append(netmeta.analyze_packets(
             packets, label, source=path.name, marks=marks,
-            idle_gap=args.idle_gap, max_window=args.max_window,
+            idle_gap=args.idle_gap, max_window=args.max_window, chain_slack=args.chain_slack,
         ))
 
     markdown = netmeta.render_markdown(reports, tz)

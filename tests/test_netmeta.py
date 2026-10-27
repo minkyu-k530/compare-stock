@@ -430,6 +430,61 @@ class ActionTests(unittest.TestCase):
             netmeta.parse_marks("soon", reference_ts=reference, tz=tz)
 
 
+class SerialDepthTests(unittest.TestCase):
+    def test_new_connection_chain_counts_dns_tcp_tls_and_request(self):
+        first = analyze(toss_like())["actions"][0]
+        self.assertEqual(first["serial_depth"], 4)
+        self.assertEqual([step["step"] for step in first["serial_chain"]],
+                         ["dns", "tcp", "tls_handshake", "request"])
+        # Equal-length chains on two connections: the one that stays on one connection wins.
+        self.assertEqual({step["name"] for step in first["serial_chain"][1:]}, {"stream.toss.test"})
+        self.assertEqual([step["wait_ms"] for step in first["serial_chain"]], [20.0, 30.0, 33.0, 90.0])
+        self.assertAlmostEqual(first["serial_wait_ms"], 173.0, places=2)
+
+    def test_parallel_requests_on_reused_connections_count_once(self):
+        report = analyze(toss_like())
+        self.assertEqual(report["actions"][2]["serial_depth"], 1)
+        self.assertEqual(report["action_summary"]["serial_depth_counts"], {"1": 2, "4": 1})
+
+    def test_quic_and_resumed_tls12_handshakes_are_one_round_trip_each(self):
+        quic, legacy = analyze(kis_like())["actions"]
+        self.assertEqual([step["step"] for step in quic["serial_chain"]], ["dns", "quic_handshake", "request"])
+        self.assertEqual([step["step"] for step in legacy["serial_chain"]], ["tcp", "tls_handshake", "request"])
+
+    def test_dependent_request_needs_to_start_within_chain_slack(self):
+        def scenario(gap):
+            s = Scenario()
+            api = Conn(s, "203.0.113.50", 50040)
+            api.open(1.0)
+            api.up(1.031, client_hello("chain.test", ("h2",)))
+            api.down(1.060, server_hello())
+            api.up(10.000, app_data(200))
+            api.down(10.040, app_data(1500))
+            api.up(10.040 + gap, app_data(200))
+            api.down(10.080 + gap, app_data(1500))
+            return s
+
+        quick = analyze(scenario(0.010))["actions"][-1]
+        self.assertEqual((quick["serial_depth"], quick["serial_wait_ms"]), (2, 80.0))
+        late = analyze(scenario(0.500))["actions"][-1]
+        self.assertEqual(late["serial_depth"], 1)
+        loose = analyze(scenario(0.500), chain_slack=0.6)["actions"][-1]
+        self.assertEqual(loose["serial_depth"], 2)
+        self.assertEqual(analyze(scenario(0.5), chain_slack=0.6)["settings"]["chain_slack_s"], 0.6)
+
+    def test_markdown_lists_chain_for_tapped_actions_only(self):
+        marks = [T0 + 0.6, T0 + 19.5]
+        report = analyze(toss_like(), marks=marks)
+        markdown = netmeta.render_markdown([report], netmeta.resolve_timezone("Asia/Seoul"))
+        self.assertIn("직렬 왕복 깊이 중앙값", markdown)
+        self.assertIn("- #1 깊이 4: DNS(", markdown)
+        self.assertIn("- #3 깊이 1: 요청(", markdown)
+        self.assertNotIn("- #2 ", markdown)
+
+    def test_no_exchanges_gives_empty_chain(self):
+        self.assertEqual(netmeta.serial_chain([]), [])
+
+
 class CommandLineTests(unittest.TestCase):
     def test_compare_two_captures_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as directory:

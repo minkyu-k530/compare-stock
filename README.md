@@ -76,7 +76,19 @@ python3 tools/tap_metronome.py --out captures/net/toss-01.marks --count 10 --int
 python3 tools/analyze_pcap.py toss=captures/net/toss-01.pcap kis=captures/net/kis-01.pcap --marks toss=captures/net/toss-01.marks --marks kis=captures/net/kis-01.marks --out captures/net/report-01.md
 ```
 
-첫 명령은 캡처 중 15초마다 탭 신호를 보내고 그 시각을 기록합니다. 두 번째 명령은 기록된 탭과 맞는 네트워크 동작만 요약에 넣고 나머지는 배경으로 표시합니다. 촬영·캡처 절차, 해석 표, 한계는 [비복호화 네트워크 메타데이터 비교](docs/NETWORK_METADATA.md)에 있습니다. 이 결과도 HTTP/3·WebSocket 사용이나 속도 차이의 원인을 확정하지 않습니다.
+첫 명령은 캡처 중 15초마다 탭 신호를 보내고 그 시각을 기록합니다. 두 번째 명령은 기록된 탭과 맞는 네트워크 동작만 요약에 넣고 나머지는 배경으로 표시합니다. 보고서에는 탭 1회의 **직렬 왕복 깊이**(DNS → TCP 연결 → TLS 핸드셰이크 → 요청처럼 앞 응답 직후 이어진 왕복 사슬의 길이)도 나옵니다. 촬영·캡처 절차, 해석 표, 한계는 [비복호화 네트워크 메타데이터 비교](docs/NETWORK_METADATA.md)에 있습니다. 이 결과도 HTTP/3·WebSocket 사용이나 속도 차이의 원인을 확정하지 않습니다.
+
+## RTT 단계별 실험 (아키텍처 추론)
+
+망 상태는 앱이 바꿀 수 없지만, 탭 뒤 몇 번의 왕복을 기다리는지는 구조가 정합니다. Mac 인터넷 공유로 휴대폰에 왕복 지연을 0·100·200·300ms 더해 같은 탭을 반복하고, 화면 시간의 **기울기 k**(추가 RTT 1ms당 늘어난 ms, 기다린 직렬 왕복의 실효 횟수)를 앱별로 구합니다. 이 값을 PCAP의 직렬 왕복 깊이와 대조합니다. 장비 구성, 보정, 64회 세션 설계, 해석 표와 결론 문장의 범위는 [아키텍처 추론 실험](docs/ARCHITECTURE_INFERENCE.md)에 있습니다. 2026-10-27 기준 실측은 없고, 지연 주입은 실제 핫스팟에서 아직 확인하지 않았습니다.
+
+```bash
+python3 tools/hotspot_delay.py on --delay-ms 100 --ping 1.1.1.1 --dry-run
+python3 tools/make_rtt_ledger.py --session-id 20261030-rtt-search > rtt-ledger-20261030-rtt-search.csv
+python3 tools/fit_rtt_slope.py --db data/rtt-20261030-rtt-search.sqlite3 --ledger rtt-ledger-20261030-rtt-search.csv --base-rtt toss=24 --base-rtt kis=19 --out captures/rtt/report.md
+```
+
+첫 명령은 지연을 거는 `sudo dnctl`·`pfctl` 명령을 보여 주기만 합니다. `--dry-run`을 빼면 Mac 비밀번호를 묻고 실제로 적용한 뒤 휴대폰에서 ping으로 확인합니다. 측정이 끝나면 `python3 tools/hotspot_delay.py off`로 해제합니다.
 
 공개 기술자료로 **확인된 것과 확인되지 않은 것**은 [docs/PUBLIC_EVIDENCE.md](docs/PUBLIC_EVIDENCE.md)에 따로 정리했습니다. 2022년 토스증권 발표에는 시세 WebSocket/HTTP API 경로가 나오고, 한국투자증권 개발자용 Open API도 WebSocket을 제공합니다. 두 모바일 앱이 지금 같은 방식으로 동작하거나 이 방식이 속도 차이의 원인이라는 뜻은 아닙니다.
 
