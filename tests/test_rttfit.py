@@ -71,12 +71,21 @@ class FitTests(unittest.TestCase):
         self.assertGreater(high, fit["slope_k"])
         self.assertGreater(fit["residual_sd_ms"], 30)
 
-    def test_base_rtt_splits_intercept_into_network_and_rest(self):
+    def test_base_rtt_is_context_without_time_share_estimates(self):
         ledger, observations = session()
-        fit = rttfit.fit_session(observations, ledger, base_rtt={"toss": 20.0})["apps"]["toss"]["fit"]
-        self.assertAlmostEqual(fit["network_share_ms"], 60.0)
-        self.assertAlmostEqual(fit["non_network_ms"], 540.0)
-        self.assertEqual(fit["bootstrap_95_ci"]["network_share_ms"], [60.0, 60.0])
+        result = rttfit.fit_session(observations, ledger, base_rtt={"toss": 20.0})
+        baseline = rttfit.fit_session(observations, ledger)
+        fit = result["apps"]["toss"]["fit"]
+        self.assertEqual(fit["base_rtt_ms"], 20.0)
+        self.assertEqual({key: value for key, value in fit.items() if key != "base_rtt_ms"},
+                         baseline["apps"]["toss"]["fit"])
+        for estimate in (fit, result["apps"]["kis"]["fit"], result["difference"]["fit"]):
+            for unsupported in ("network_share_ms", "non_network_ms"):
+                self.assertNotIn(unsupported, estimate)
+                self.assertNotIn(unsupported, estimate["bootstrap_95_ci"])
+        self.assertNotIn("base_rtt_ms", result["apps"]["kis"]["fit"])
+        self.assertIn("not a direct round-trip count", result["interpretation"]["slope_k"])
+        self.assertIn("context only", result["interpretation"]["base_rtt_ms"])
         with self.assertRaisesRegex(ValueError, "base_rtt"):
             rttfit.fit_session(observations, ledger, base_rtt={"toss": 0.0})
 
@@ -135,7 +144,13 @@ class FitTests(unittest.TestCase):
         self.assertIn("해석 범위", markdown)
         self.assertIn("예비 결과", markdown)
         self.assertIn("| k (ms/ms) | 3.00 | 1.00 | 2.00 |", markdown)
-        self.assertIn("| 망 몫(ms) | - | 15.0 |", markdown)
+        self.assertIn("RTT 민감도", markdown)
+        self.assertIn("요청 간 의존성을 식별하지 않는다", markdown)
+        self.assertIn("| 기본 RTT 입력(ms) | - | 15.0 |", markdown)
+        self.assertIn("기울기·절편 적합에 사용하지 않는다", markdown)
+        self.assertIn("분해할 수 없다", markdown)
+        self.assertNotIn("망 몫(ms)", markdown)
+        self.assertNotIn("망 외 시간(ms)", markdown)
 
 
 class LedgerTests(unittest.TestCase):
@@ -194,8 +209,11 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(fit_rtt_slope.main(arguments), 0)
             result = json.loads(data.read_text(encoding="utf-8"))
             self.assertAlmostEqual(result["apps"]["toss"]["fit"]["slope_k"], 3.0)
+            self.assertEqual(result["apps"]["toss"]["fit"]["base_rtt_ms"], 20.0)
+            self.assertNotIn("network_share_ms", result["apps"]["toss"]["fit"])
+            self.assertNotIn("non_network_ms", result["apps"]["toss"]["fit"]["bootstrap_95_ci"])
             self.assertEqual(result["exclusions"], [])  # the demo row never reaches the fit
-            self.assertIn("기본 망에서의 대략적 분해", out.read_text(encoding="utf-8"))
+            self.assertIn("입력한 기본 RTT (참고 정보)", out.read_text(encoding="utf-8"))
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 fit_rtt_slope.main(arguments)
 

@@ -2,8 +2,9 @@
 
 Reads the session's own SQLite file (read-only, demo rows excluded) and the
 RTT ledger from tools/make_rtt_ledger.py.  The slope k is the extra screen
-time per millisecond of added round trip, i.e. the effective number of serial
-network round trips; see docs/ARCHITECTURE_INFERENCE.md.
+time per millisecond of planned added round trip: RTT sensitivity in this
+setup, not a direct count of requests or round trips.  Baseline RTT values
+are optional context only; see docs/ARCHITECTURE_INFERENCE.md.
 
 Example:
   python3 tools/fit_rtt_slope.py --db data/rtt-20261030-search.sqlite3 \\
@@ -68,8 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, required=True, help="SQLite file of this RTT session only")
     parser.add_argument("--ledger", type=Path, required=True, help="RTT ledger CSV with every outcome filled in")
     parser.add_argument("--base-rtt", action="append", type=_base_rtt, default=[],
-                        help="APP=MS baseline RTT to the app's servers at added 0 ms, e.g. the TCP connect "
-                             "median from tools/analyze_pcap.py; enables the network-share split")
+                        help="APP=MS optional baseline RTT context retained in the report; "
+                             "does not identify network time shares or affect the fit")
     parser.add_argument("--out", type=Path, help="write the Markdown report here instead of stdout")
     parser.add_argument("--json", type=Path, help="also write the full JSON result here")
     parser.add_argument("--force", action="store_true", help="overwrite existing --out/--json files")
